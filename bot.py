@@ -15,7 +15,7 @@ log = logging.getLogger('alpha')
 BOT_TOKEN = "8943388643:AAFYLrveqsYlmZpGpvsDYsKhiwWQy8LFIe0"
 ADMIN_ID = 8067626951
 LAMIX_TOKEN = "sNf7xjfQxZOfNLjAgmYOm8xmCcQuHRRa5zpmjAViQeE"
-DATABASE_URL = 
+DATABASE_URL = "postgresql://neondb_owner:npg_0sMgNmJh6OVz@ep-broad-sun-b31s5xkj-pooler.c-4.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
 LAMIX_BASE = "https://panel.lamix.org/api/v1/"
 PORT = int(os.getenv('PORT', '10000'))
 
