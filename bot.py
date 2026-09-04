@@ -1,312 +1,866 @@
-import os, time, json, threading, logging
+import os
+import re
+import hmac
+import hashlib
+import logging
+import threading
 from decimal import Decimal, InvalidOperation
-from datetime import datetime, timezone
-from functools import wraps
+from datetime import datetime, timezone, timedelta
 
 import requests
-import psycopg
-from psycopg_pool import ConnectionPool
-from flask import Flask, jsonify
 import pyotp
+import firebase_admin
+from firebase_admin import credentials, firestore
+from flask import Flask, request, jsonify
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-log = logging.getLogger('alpha')
+# ============================================================
+# Lamix Safe Management Bot
+# - Telegram webhook + Flask
+# - Firebase/Firestore
+# - Lamix Agent API: ranges, numbers, clients, CDRs, messages
+# - No automated third-party verification/OTP forwarding
+# ============================================================
 
-BOT_TOKEN = "8943388643:AAFYLrveqsYlmZpGpvsDYsKhiwWQy8LFIe0"
-ADMIN_ID = 8067626951
-LAMIX_TOKEN = "sNf7xjfQxZOfNLjAgmYOm8xmCcQuHRRa5zpmjAViQeE"
-DATABASE_URL = "postgresql://neondb_owner:npg_0sMgNmJh6OVz@ep-broad-sun-b31s5xkj-pooler.c-4.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
-LAMIX_BASE = "https://panel.lamix.org/api/v1/"
-PORT = int(os.getenv('PORT', '10000'))
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("lamix-bot")
 
-TG = f'https://api.telegram.org/bot{BOT_TOKEN}'
+BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+ADMIN_ID = int(os.environ["ADMIN_ID"])
+LAMIX_TOKEN = os.environ["LAMIX_API_TOKEN"]
+LAMIX_BASE_URL = os.getenv("LAMIX_BASE_URL", "https://panel.lamix.org/api/v1").rstrip("/")
+PUBLIC_URL = os.environ["PUBLIC_URL"].rstrip("/")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+PORT = int(os.getenv("PORT", "10000"))
+NUMBER_REQUEST_COUNT = max(1, min(6, int(os.getenv("NUMBER_REQUEST_COUNT", "1"))))
+MESSAGE_POLL_SECONDS = int(os.getenv("MESSAGE_POLL_SECONDS", "20"))
 
-# -------------------- Telegram --------------------
-def tg(method, payload=None, timeout=35):
-    r = requests.post(f'{TG}/{method}', json=payload or {}, timeout=timeout)
-    try: data = r.json()
-    except Exception: data = {'ok': False, 'description': r.text[:300]}
-    if not data.get('ok'):
-        log.warning('Telegram %s failed: %s', method, data.get('description'))
+app = Flask(__name__)
+
+# ---------------- Firebase ----------------
+if not firebase_admin._apps:
+    if os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON"):
+        import json
+        service = json.loads(os.environ["FIREBASE_SERVICE_ACCOUNT_JSON"])
+        firebase_admin.initialize_app(credentials.Certificate(service))
+    elif os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+        firebase_admin.initialize_app(
+            credentials.Certificate(os.environ["GOOGLE_APPLICATION_CREDENTIALS"])
+        )
+    else:
+        firebase_admin.initialize_app()
+
+db = firestore.client()
+
+# ---------------- Telegram ----------------
+TG_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
+http = requests.Session()
+http.headers.update({"User-Agent": "LamixSafeBot/1.0"})
+
+def tg(method, payload=None, timeout=20):
+    r = http.post(f"{TG_BASE}/{method}", json=payload or {}, timeout=timeout)
+    r.raise_for_status()
+    data = r.json()
+    if not data.get("ok"):
+        raise RuntimeError(data.get("description", "Telegram API error"))
+    return data.get("result")
+
+def send_message(chat_id, text, reply_markup=None, parse_mode="HTML"):
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return tg("sendMessage", payload)
+
+def edit_message(chat_id, message_id, text, reply_markup=None):
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": text,
+               "parse_mode": "HTML"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return tg("editMessageText", payload)
+
+def answer_callback(callback_id, text=None, alert=False):
+    payload = {"callback_query_id": callback_id}
+    if text:
+        payload["text"] = text
+        payload["show_alert"] = alert
+    try:
+        return tg("answerCallbackQuery", payload)
+    except Exception:
+        return None
+
+def set_webhook():
+    payload = {"url": f"{PUBLIC_URL}/telegram/webhook"}
+    if WEBHOOK_SECRET:
+        payload["secret_token"] = WEBHOOK_SECRET
+    result = tg("setWebhook", payload)
+    log.info("Webhook configured: %s", result)
+    return result
+
+# ---------------- Firestore helpers ----------------
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+def dec(value):
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError):
+        return Decimal("0")
+
+def user_ref(uid):
+    return db.collection("users").document(str(uid))
+
+def get_user(uid):
+    snap = user_ref(uid).get()
+    return snap.to_dict() if snap.exists else None
+
+def ensure_user(tg_user, referrer=None):
+    uid = str(tg_user["id"])
+    ref = user_ref(uid)
+    snap = ref.get()
+    if snap.exists:
+        ref.set({
+            "first_name": tg_user.get("first_name", ""),
+            "last_name": tg_user.get("last_name", ""),
+            "username": tg_user.get("username", ""),
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        }, merge=True)
+        return snap.to_dict()
+
+    data = {
+        "telegram_id": int(uid),
+        "first_name": tg_user.get("first_name", ""),
+        "last_name": tg_user.get("last_name", ""),
+        "username": tg_user.get("username", ""),
+        "balance": "0.0000",
+        "lifetime_earned": "0.0000",
+        "referral_bonus_earned": "0.0000",
+        "referral_commission_earned": "0.0000",
+        "referred_by": str(referrer) if referrer and str(referrer) != uid else None,
+        "created_at": firestore.SERVER_TIMESTAMP,
+        "updated_at": firestore.SERVER_TIMESTAMP,
+        "blocked": False,
+    }
+    ref.set(data)
+    if referrer and str(referrer) != uid:
+        award_referral_join_bonus(str(referrer), uid)
     return data
 
-def send(chat_id, text, markup=None):
-    p={'chat_id':chat_id,'text':text,'parse_mode':'HTML','disable_web_page_preview':True}
-    if markup: p['reply_markup']=markup
-    return tg('sendMessage', p)
+def settings_ref():
+    return db.collection("settings").document("main")
 
-def edit(chat_id, msg_id, text, markup=None):
-    p={'chat_id':chat_id,'message_id':msg_id,'text':text,'parse_mode':'HTML','disable_web_page_preview':True}
-    if markup: p['reply_markup']=markup
-    return tg('editMessageText', p)
+def get_settings():
+    snap = settings_ref().get()
+    if snap.exists:
+        return snap.to_dict()
+    defaults = {
+        "main_channel": "",
+        "support_id": "",
+        "forward_group": "",
+        "force_join_enabled": False,
+        "force_join_channels": [],
+        "withdraw_enabled": True,
+        "min_withdraw": "10.0000",
+        "withdraw_methods": ["bKash", "Nagad"],
+        "referral_join_bonus": "0.0000",
+        "referral_commission_percent": "0.0",
+        "number_request_count": NUMBER_REQUEST_COUNT,
+        "service_enabled": True,
+        "updated_at": firestore.SERVER_TIMESTAMP,
+    }
+    settings_ref().set(defaults)
+    return defaults
 
-def answer(qid, text='', alert=False):
-    return tg('answerCallbackQuery', {'callback_query_id':qid,'text':text,'show_alert':alert})
+def set_setting(key, value):
+    settings_ref().set({key: value, "updated_at": firestore.SERVER_TIMESTAMP}, merge=True)
 
-# -------------------- DB --------------------
-pool = ConnectionPool(DATABASE_URL, min_size=1, max_size=10, open=True)
+def transaction_ref():
+    return db.collection("transactions")
 
-def db_init():
-    with pool.connection() as c:
-        c.execute('''CREATE TABLE IF NOT EXISTS users(
-            telegram_id BIGINT PRIMARY KEY, username TEXT, first_name TEXT,
-            balance NUMERIC(18,4) NOT NULL DEFAULT 0, referred_by BIGINT,
-            referral_paid BOOLEAN NOT NULL DEFAULT FALSE,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now())''')
-        c.execute('''CREATE TABLE IF NOT EXISTS settings(
-            key TEXT PRIMARY KEY, value TEXT NOT NULL)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS services(
-            id BIGSERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL, enabled BOOLEAN NOT NULL DEFAULT TRUE,
-            price NUMERIC(18,4) NOT NULL DEFAULT 0, quantity INTEGER NOT NULL DEFAULT 1)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS orders(
-            id BIGSERIAL PRIMARY KEY, telegram_id BIGINT NOT NULL, msisdn TEXT NOT NULL,
-            range_id BIGINT, service TEXT, price NUMERIC(18,4) NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'active', created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            released_at TIMESTAMPTZ)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS wallet_transactions(
-            id BIGSERIAL PRIMARY KEY, telegram_id BIGINT NOT NULL, amount NUMERIC(18,4) NOT NULL,
-            type TEXT NOT NULL, note TEXT, ref TEXT UNIQUE, created_at TIMESTAMPTZ NOT NULL DEFAULT now())''')
-        c.execute('''CREATE TABLE IF NOT EXISTS referrals(
-            id BIGSERIAL PRIMARY KEY, referrer BIGINT NOT NULL, referred BIGINT UNIQUE NOT NULL,
-            bonus NUMERIC(18,4) NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT now())''')
-        c.execute('''CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(telegram_id,status)''')
-        c.execute('''CREATE INDEX IF NOT EXISTS idx_wallet_user ON wallet_transactions(telegram_id,created_at DESC)''')
-        for k,v in {
-            'support_id':'Not configured', 'main_channel':'', 'referral_bonus':'0',
-            'commission_percent':'0', 'default_quantity':'1'
-        }.items():
-            c.execute('INSERT INTO settings(key,value) VALUES(%s,%s) ON CONFLICT(key) DO NOTHING',(k,v))
+def add_transaction(uid, kind, amount, meta=None):
+    amount_s = f"{dec(amount):.4f}"
+    transaction_ref().add({
+        "user_id": str(uid),
+        "kind": kind,
+        "amount": amount_s,
+        "meta": meta or {},
+        "created_at": firestore.SERVER_TIMESTAMP,
+    })
 
-def setting(k, default=''):
-    with pool.connection() as c:
-        r=c.execute('SELECT value FROM settings WHERE key=%s',(k,)).fetchone()
-        return r[0] if r else default
+def change_balance(uid, amount, reason, meta=None):
+    amount_d = dec(amount)
+    ref = user_ref(uid)
+    snap = ref.get()
+    if not snap.exists:
+        return False
+    data = snap.to_dict()
+    new_bal = dec(data.get("balance", "0")) + amount_d
+    if new_bal < 0:
+        return False
+    updates = {"balance": f"{new_bal:.4f}", "updated_at": firestore.SERVER_TIMESTAMP}
+    if amount_d > 0:
+        lifetime = dec(data.get("lifetime_earned", "0")) + amount_d
+        updates["lifetime_earned"] = f"{lifetime:.4f}"
+    ref.set(updates, merge=True)
+    add_transaction(uid, reason, amount_d, meta)
+    return True
 
-def set_setting(k,v):
-    with pool.connection() as c:
-        c.execute('INSERT INTO settings(key,value) VALUES(%s,%s) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value',(k,str(v)))
+def award_referral_join_bonus(referrer_id, referred_id):
+    s = get_settings()
+    bonus = dec(s.get("referral_join_bonus", "0"))
+    if bonus <= 0:
+        return
+    ref = user_ref(referrer_id)
+    snap = ref.get()
+    if not snap.exists:
+        return
+    data = snap.to_dict()
+    already = dec(data.get("referral_bonus_earned", "0"))
+    # Join bonus is one-time per referred user; transaction query is avoided
+    # by a dedicated referral edge document.
+    edge = db.collection("referrals").document(f"{referrer_id}_{referred_id}")
+    if edge.get().exists:
+        return
+    edge.set({
+        "referrer_id": str(referrer_id),
+        "referred_id": str(referred_id),
+        "type": "join_bonus",
+        "amount": f"{bonus:.4f}",
+        "created_at": firestore.SERVER_TIMESTAMP,
+    })
+    new_bonus = already + bonus
+    user_ref(referrer_id).set({"referral_bonus_earned": f"{new_bonus:.4f}"}, merge=True)
+    change_balance(referrer_id, bonus, "referral_join_bonus", {"referred_user": str(referred_id)})
 
-def user_upsert(u, ref=None):
-    uid=int(u['id']); username=u.get('username'); first=u.get('first_name','User')
-    with pool.connection() as c:
-        exists=c.execute('SELECT referred_by FROM users WHERE telegram_id=%s',(uid,)).fetchone()
-        if exists is None:
-            rb = ref if ref and ref != uid else None
-            c.execute('INSERT INTO users(telegram_id,username,first_name,referred_by) VALUES(%s,%s,%s,%s)',(uid,username,first,rb))
-            if rb:
-                bonus=Decimal(setting('referral_bonus','0'))
-                c.execute('INSERT INTO referrals(referrer,referred,bonus) VALUES(%s,%s,%s) ON CONFLICT(referred) DO NOTHING',(rb,uid,bonus))
-                if bonus>0:
-                    refstr=f'signup:{uid}'
-                    try:
-                        c.execute('INSERT INTO wallet_transactions(telegram_id,amount,type,note,ref) VALUES(%s,%s,%s,%s,%s)',(rb,bonus,'referral','Signup referral bonus',refstr))
-                        c.execute('UPDATE users SET balance=balance+%s WHERE telegram_id=%s',(bonus,rb))
-                    except psycopg.errors.UniqueViolation: c.rollback()
+# ---------------- Lamix API ----------------
+class LamixAPI:
+    def __init__(self, token):
+        self.s = requests.Session()
+        self.s.headers.update({
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        })
+
+    def get(self, path, params=None):
+        r = self.s.get(f"{LAMIX_BASE_URL}/{path.lstrip('/')}", params=params, timeout=20)
+        if r.status_code == 429:
+            raise RuntimeError("Lamix rate limit reached; retry later.")
+        if r.status_code >= 400:
+            try:
+                err = r.json().get("error", "unknown_error")
+            except Exception:
+                err = "http_error"
+            raise RuntimeError(f"Lamix API error: {err}")
+        return r.json()
+
+    def post(self, path, body):
+        r = self.s.post(f"{LAMIX_BASE_URL}/{path.lstrip('/')}", json=body, timeout=20)
+        if r.status_code == 429:
+            raise RuntimeError("Lamix rate limit reached; retry later.")
+        if r.status_code >= 400:
+            try:
+                err = r.json().get("error", "unknown_error")
+            except Exception:
+                err = "http_error"
+            raise RuntimeError(f"Lamix API error: {err}")
+        return r.json()
+
+    def messages(self, limit=50, **params):
+        params = {k: v for k, v in params.items() if v not in (None, "")}
+        params["limit"] = min(1000, max(1, int(limit)))
+        return self.get("/messages", params)
+
+    def ranges(self):
+        return self.get("/ranges")
+
+    def numbers(self, limit=100, after=None, range_id=None, assigned=None, search=None):
+        params = {"limit": min(500, max(1, int(limit)))}
+        if after:
+            params["after"] = after
+        if range_id:
+            params["rangeId"] = range_id
+        if assigned is not None:
+            params["assigned"] = str(bool(assigned)).lower()
+        if search:
+            params["search"] = search
+        return self.get("/numbers", params)
+
+    def cdrs(self, limit=100, **params):
+        params = {k: v for k, v in params.items() if v not in (None, "")}
+        params["limit"] = min(500, max(1, int(limit)))
+        return self.get("/cdrs", params)
+
+    def clients(self, limit=100):
+        return self.get("/clients", {"limit": min(500, max(1, int(limit)))})
+
+    def assign(self, client, numbers, client_payout_rate):
+        return self.post("/numbers/assign", {
+            "client": client,
+            "numbers": numbers[:1000],
+            "clientPayoutRate": f"{dec(client_payout_rate):.4f}",
+        })
+
+    def unassign(self, numbers):
+        return self.post("/numbers/unassign", {"numbers": numbers[:1000]})
+
+lamix = LamixAPI(LAMIX_TOKEN)
+
+# ---------------- Safe message redaction ----------------
+CODE_RE = re.compile(r"(?<!\d)\d{3,8}(?!\d)")
+
+def redact_sensitive_digits(text):
+    # Do not expose likely verification codes in bot/group UI.
+    def repl(m):
+        token = m.group(0)
+        if len(token) >= 4:
+            return "•" * len(token)
+        return token
+    return CODE_RE.sub(repl, str(text or ""))
+
+def mask_number(number):
+    n = str(number).lstrip("+")
+    if len(n) <= 6:
+        return "*" * len(n)
+    return f"{n[:3]}***{n[-3:]}"
+
+# ---------------- Keyboards ----------------
+def button(text, callback_data=None, url=None, style=None):
+    b = {"text": text}
+    if callback_data:
+        b["callback_data"] = callback_data
+    if url:
+        b["url"] = url
+    if style:
+        b["style"] = style
+    return b
+
+def main_keyboard(uid):
+    rows = [
+        [button("Get Number", "user_numbers", style="success"),
+         button("2FA", "twofa", style="success")],
+        [button("Traffic", "traffic", style="primary"),
+         button("Wallet", "wallet", style="primary")],
+        [button("Invite", "invite", style="danger"),
+         button("Support", "support", style="danger")],
+    ]
+    if uid == ADMIN_ID:
+        rows.append([button("AdminPanel", "admin", style="success")])
+    return {"inline_keyboard": rows}
+
+def back_kb():
+    return {"inline_keyboard": [[button("BACK", "home", style="danger")]]}
+
+def admin_keyboard():
+    return {"inline_keyboard": [
+        [button("Dashboard", "adm_dashboard", style="primary"),
+         button("Lamix Sync", "adm_sync", style="primary")],
+        [button("Ranges", "adm_ranges", style="primary"),
+         button("Numbers", "adm_numbers", style="primary")],
+        [button("Clients", "adm_clients", style="primary"),
+         button("Traffic", "adm_traffic", style="primary")],
+        [button("Users", "adm_users", style="primary"),
+         button("Wallet", "adm_wallet", style="primary")],
+        [button("Settings", "adm_settings", style="success")],
+        [button("Force Join", "adm_forcejoin", style="success"),
+         button("Broadcast", "adm_broadcast", style="success")],
+        [button("Home", "home", style="danger")],
+    ]}
+
+def settings_keyboard():
+    return {"inline_keyboard": [
+        [button("Main Channel", "set_main_channel", style="primary"),
+         button("Support ID", "set_support", style="primary")],
+        [button("Forward Group", "set_group", style="primary"),
+         button("Min Withdraw", "set_min_withdraw", style="primary")],
+        [button("Referral Bonus", "set_ref_bonus", style="primary"),
+         button("Referral %", "set_ref_pct", style="primary")],
+        [button("Number Count", "set_num_count", style="primary")],
+        [button("Force Join", "adm_forcejoin", style="success")],
+        [button("BACK", "admin", style="danger")],
+    ]}
+
+# ---------------- In-memory admin states ----------------
+states = {}
+state_lock = threading.Lock()
+
+def set_state(uid, state):
+    with state_lock:
+        states[str(uid)] = state
+
+def pop_state(uid):
+    with state_lock:
+        return states.pop(str(uid), None)
+
+# ---------------- UI ----------------
+def home_text(user):
+    s = get_settings()
+    name = user.get("first_name", "User")
+    return (
+        f"<b>Welcome, {name}!</b>\n\n"
+        "Use the menu below.\n\n"
+        f"📢 Channel: {'Configured' if s.get('main_channel') else 'Not configured'}\n"
+        f"🛟 Support: {'Configured' if s.get('support_id') else 'Not configured'}"
+    )
+
+def handle_start(message):
+    tg_user = message["from"]
+    args = (message.get("text") or "").split(maxsplit=1)
+    ref = None
+    if len(args) == 2 and args[1].startswith("ref_"):
+        ref = args[1][4:].strip()
+        if not ref.isdigit():
+            ref = None
+    user = ensure_user(tg_user, ref)
+    if user.get("blocked"):
+        send_message(message["chat"]["id"], "Your account is blocked.")
+        return
+    send_message(message["chat"]["id"], home_text(user), main_keyboard(int(tg_user["id"])))
+
+def handle_text(message):
+    uid = int(message["from"]["id"])
+    text = (message.get("text") or "").strip()
+    st = pop_state(uid)
+    if not st:
+        return
+    action = st.get("action")
+    if uid != ADMIN_ID:
+        return
+
+    if action == "main_channel":
+        set_setting("main_channel", text)
+        send_message(uid, "Main channel updated.", settings_keyboard())
+    elif action == "support":
+        set_setting("support_id", text)
+        send_message(uid, "Support ID updated.", settings_keyboard())
+    elif action == "group":
+        set_setting("forward_group", text)
+        send_message(uid, "Forward group updated.", settings_keyboard())
+    elif action == "min_withdraw":
+        value = dec(text)
+        if value < 0:
+            send_message(uid, "Invalid amount.", settings_keyboard())
         else:
-            c.execute('UPDATE users SET username=%s,first_name=%s,updated_at=now() WHERE telegram_id=%s',(username,first,uid))
+            set_setting("min_withdraw", f"{value:.4f}")
+            send_message(uid, "Minimum withdrawal updated.", settings_keyboard())
+    elif action == "ref_bonus":
+        value = dec(text)
+        if value < 0:
+            send_message(uid, "Invalid amount.", settings_keyboard())
+        else:
+            set_setting("referral_join_bonus", f"{value:.4f}")
+            send_message(uid, "Referral join bonus updated.", settings_keyboard())
+    elif action == "ref_pct":
+        value = dec(text)
+        if value < 0 or value > 100:
+            send_message(uid, "Enter a percentage from 0 to 100.", settings_keyboard())
+        else:
+            set_setting("referral_commission_percent", str(value))
+            send_message(uid, "Referral commission percentage updated.", settings_keyboard())
+    elif action == "num_count":
+        try:
+            n = int(text)
+            if not 1 <= n <= 6:
+                raise ValueError
+            set_setting("number_request_count", n)
+            send_message(uid, f"Default number count set to {n}.", settings_keyboard())
+        except Exception:
+            send_message(uid, "Enter an integer from 1 to 6.", settings_keyboard())
+    elif action == "broadcast":
+        # Admin can broadcast ordinary informational text.
+        sent = 0
+        for snap in db.collection("users").stream():
+            d = snap.to_dict()
+            if d.get("blocked"):
+                continue
+            try:
+                send_message(int(snap.id), text)
+                sent += 1
+            except Exception:
+                pass
+        send_message(uid, f"Broadcast finished. Sent: {sent}", admin_keyboard())
 
-def balance(uid):
-    with pool.connection() as c:
-        r=c.execute('SELECT balance FROM users WHERE telegram_id=%s',(uid,)).fetchone()
-        return Decimal(r[0]) if r else Decimal('0')
-
-def add_balance(uid, amount, typ, note='', ref=None):
-    amount=Decimal(str(amount))
-    with pool.connection() as c:
-        if ref:
-            old=c.execute('SELECT 1 FROM wallet_transactions WHERE ref=%s',(ref,)).fetchone()
-            if old: return False
-        c.execute('UPDATE users SET balance=balance+%s,updated_at=now() WHERE telegram_id=%s',(amount,uid))
-        c.execute('INSERT INTO wallet_transactions(telegram_id,amount,type,note,ref) VALUES(%s,%s,%s,%s,%s)',(uid,amount,typ,note,ref))
-        return True
-
-# -------------------- Lamix --------------------
-class Lamix:
-    def __init__(self):
-        self.s=requests.Session(); self.s.headers.update({'Authorization':f'Bearer {LAMIX_TOKEN}','Accept':'application/json'})
-        self.lock=threading.Lock(); self.last=0.0
-    def request(self, method, path, **kwargs):
-        with self.lock:
-            wait=1.05-(time.monotonic()-self.last)
-            if wait>0: time.sleep(wait)
-            self.last=time.monotonic()
-        url=LAMIX_BASE+'/'+path.lstrip('/')
-        for attempt in range(4):
-            r=self.s.request(method,url,timeout=30,**kwargs)
-            if r.status_code==429:
-                time.sleep(min(int(r.headers.get('Retry-After','2')),10)); continue
-            if r.status_code>=500:
-                time.sleep(2**attempt); continue
-            if not r.ok:
-                try: detail=r.json()
-                except Exception: detail=r.text[:500]
-                raise RuntimeError(f'Lamix HTTP {r.status_code}: {detail}')
-            return r.json()
-        raise RuntimeError('Lamix API unavailable after retries')
-    def ranges(self): return self.request('GET','ranges')
-    def numbers(self, **params): return self.request('GET','numbers',params=params)
-    def messages(self, **params): return self.request('GET','messages',params=params)
-    def cdrs(self, **params): return self.request('GET','cdrs',params=params)
-    def clients(self, **params): return self.request('GET','clients',params=params)
-    def create_client(self, payload): return self.request('POST','clients',json=payload)
-    def assign(self, payload): return self.request('POST','numbers/assign',json=payload)
-    def unassign(self, payload): return self.request('POST','numbers/unassign',json=payload)
-lamix=Lamix()
-
-# -------------------- UI --------------------
-def main_kb(admin=False):
-    rows=[[{'text':'🟢 Get Number'},{'text':'🟢 2FA'}],[{'text':'🔵 Traffic'},{'text':'🔵 Wallet'}],[{'text':'🔴 Invite'},{'text':'🔴 Support'}]]
-    if admin: rows.append([{'text':'🟢 AdminPanel'}])
-    return {'keyboard':rows,'resize_keyboard':True}
-
-def inline(rows): return {'inline_keyboard':rows}
-
-def admin_kb():
-    return inline([
-        [{'text':'📱 Numbers','callback_data':'a_numbers'},{'text':'🌎 Ranges','callback_data':'a_ranges'}],
-        [{'text':'💵 CDR','callback_data':'a_cdr'},{'text':'👥 Clients','callback_data':'a_clients'}],
-        [{'text':'📊 Statistics','callback_data':'a_stats'},{'text':'⚙️ Settings','callback_data':'a_settings'}],
-    ])
-
-# -------------------- Helpers --------------------
-def short(v,n=3800):
-    s=str(v); return s if len(s)<=n else s[:n]+'…'
-
-def is_admin(uid): return int(uid)==ADMIN_ID
-
-def safe_decimal(s):
-    try:return Decimal(str(s))
-    except InvalidOperation:return Decimal('0')
-
-# -------------------- Handlers --------------------
-def show_ranges(chat_id, mid=None):
+def show_numbers(chat_id):
     try:
-        data=lamix.ranges(); rows=[]
-        for r in data.get('ranges', data if isinstance(data,list) else []):
-            rid=r.get('id'); name=r.get('name',rid); avail=r.get('unassignedNumbers',r.get('numbers','?'))
-            rows.append([{'text':f'{name} • {avail}', 'callback_data':f'range:{rid}'}])
-        text='🌎 <b>Available Ranges</b>\n\nSelect a range.' if rows else '❌ No ranges returned.'
-        if mid: edit(chat_id,mid,text,inline(rows))
-        else: send(chat_id,text,inline(rows))
-    except Exception as e: send(chat_id,f'❌ Lamix error: <code>{short(e,500)}</code>')
+        data = lamix.numbers(limit=100)
+        records = data.get("records", [])
+        if not records:
+            send_message(chat_id, "No Lamix numbers are currently visible.", back_kb())
+            return
+        # Safe inventory view: masked numbers only, grouped by range.
+        groups = {}
+        for r in records[:60]:
+            groups.setdefault(r.get("range", "Unknown"), []).append(r)
+        lines = ["<b>Available Lamix Inventory</b>", ""]
+        for rng, nums in groups.items():
+            lines.append(f"<b>{rng}</b> — {len(nums)} visible")
+            for n in nums[:10]:
+                lines.append(f"• {mask_number(n.get('number',''))} — {n.get('status','unknown')}")
+        lines.append("")
+        lines.append("Numbers are masked here; assignment controls are available to admins.")
+        send_message(chat_id, "\n".join(lines), back_kb())
+    except Exception as e:
+        log.exception("numbers")
+        send_message(chat_id, f"Could not load numbers: {e}", back_kb())
 
-def show_numbers(chat_id, mid=None, range_id=None):
+def show_traffic(chat_id):
     try:
-        p={'limit':50,'assigned':'false'}
-        if range_id is not None:p['rangeId']=range_id
-        data=lamix.numbers(**p); nums=data.get('numbers', data if isinstance(data,list) else [])
-        text='📱 <b>Numbers</b>\n\n'+('\n'.join(f'• <code>{n.get("msisdn",n.get("number","?"))}</code>' for n in nums[:80]) or 'No unassigned numbers.')
-        if mid: edit(chat_id,mid,short(text),inline([[{'text':'🔄 Refresh','callback_data':'a_numbers'}],[{'text':'⬅️ Admin','callback_data':'a_home'}]]))
-        else: send(chat_id,short(text),inline([[{'text':'🔄 Refresh','callback_data':'a_numbers'}]]))
-    except Exception as e: send(chat_id,f'❌ Lamix error: <code>{short(e,500)}</code>')
+        data = lamix.cdrs(limit=100)
+        records = data.get("records", [])
+        total = sum((dec(x.get("payout")) for x in records), Decimal("0"))
+        cleared = sum(1 for x in records if x.get("status") == "cleared")
+        send_message(
+            chat_id,
+            "<b>Traffic</b>\n\n"
+            f"Records: {len(records)}\n"
+            f"Cleared: {cleared}\n"
+            f"Own payout in sample: {total:.4f}\n\n"
+            "Detailed upstream earnings are never exposed to users.",
+            back_kb(),
+        )
+    except Exception as e:
+        send_message(chat_id, f"Traffic unavailable: {e}", back_kb())
 
-def traffic(chat_id):
+def show_wallet(chat_id, uid):
+    user = get_user(uid) or {}
+    send_message(
+        chat_id,
+        "<b>Wallet</b>\n\n"
+        f"Balance: <code>{dec(user.get('balance','0')):.4f}</code>\n"
+        f"Lifetime earned: <code>{dec(user.get('lifetime_earned','0')):.4f}</code>\n"
+        f"Referral bonus: <code>{dec(user.get('referral_bonus_earned','0')):.4f}</code>\n"
+        f"Referral commission: <code>{dec(user.get('referral_commission_earned','0')):.4f}</code>",
+        back_kb(),
+    )
+
+def show_invite(chat_id, uid):
+    me = tg("getMe")
+    username = me.get("username", "")
+    link = f"https://t.me/{username}?start=ref_{uid}"
+    send_message(
+        chat_id,
+        "<b>Invite</b>\n\n"
+        f"Your referral link:\n<code>{link}</code>\n\n"
+        "Referral join bonus and commission are controlled by the admin.",
+        back_kb(),
+    )
+
+def show_support(chat_id):
+    s = get_settings()
+    target = s.get("support_id") or "Not configured"
+    send_message(chat_id, f"<b>Support</b>\n\nContact: {target}", back_kb())
+
+def show_2fa(chat_id):
+    send_message(
+        chat_id,
+        "<b>2FA / TOTP</b>\n\n"
+        "Send a TOTP secret that you are authorized to use. "
+        "The secret is processed only for the current calculation and is not stored.\n\n"
+        "Example format: <code>JBSWY3DPEHPK3PXP</code>",
+        back_kb(),
+    )
+
+def calculate_totp(secret):
+    secret = re.sub(r"\s+", "", secret).upper()
+    if not re.fullmatch(r"[A-Z2-7]+=*", secret):
+        raise ValueError("Invalid Base32 TOTP secret.")
+    return pyotp.TOTP(secret).now()
+
+def show_admin(chat_id):
+    if chat_id != ADMIN_ID:
+        return
+    send_message(chat_id, "<b>AdminPanel</b>\n\nSelect an action.", admin_keyboard())
+
+def admin_dashboard(chat_id):
+    users = sum(1 for _ in db.collection("users").stream())
+    s = get_settings()
     try:
-        data=lamix.messages(limit=20)
-        msgs=data.get('messages',data if isinstance(data,list) else [])
-        # Do not expose authentication codes. Only metadata is shown.
-        lines=[]
-        for m in msgs[:20]:
-            num=m.get('number') or m.get('to') or m.get('from') or '?'
-            ts=m.get('createdAt') or m.get('timestamp') or ''
-            lines.append(f'• <code>{num}</code> — {ts}')
-        send(chat_id,'🔵 <b>Traffic</b>\n\n'+('\n'.join(lines) if lines else 'No recent traffic.'))
-    except Exception as e: send(chat_id,f'❌ Traffic error: <code>{short(e,500)}</code>')
+        ranges = lamix.ranges().get("records", [])
+        numbers = lamix.numbers(limit=1).get("count", 0)
+    except Exception:
+        ranges, numbers = [], "API error"
+    send_message(
+        chat_id,
+        "<b>Dashboard</b>\n\n"
+        f"Users: {users}\n"
+        f"Ranges: {len(ranges)}\n"
+        f"Numbers count: {numbers}\n"
+        f"Default number count: {s.get('number_request_count', 1)}\n"
+        f"Min withdrawal: {s.get('min_withdraw','0')}",
+        admin_keyboard(),
+    )
 
-def wallet(chat_id,uid):
-    with pool.connection() as c:
-        rows=c.execute('SELECT amount,type,note,created_at FROM wallet_transactions WHERE telegram_id=%s ORDER BY created_at DESC LIMIT 10',(uid,)).fetchall()
-    lines=[f'• {r[1]}: {r[0]} — {r[2] or ""}' for r in rows]
-    send(chat_id,f'💰 <b>Wallet</b>\n\nBalance: <code>{balance(uid):.4f}</code>\n\n'+'\n'.join(lines))
+def admin_sync(chat_id):
+    try:
+        ranges = lamix.ranges().get("records", [])
+        db.collection("cache").document("ranges").set({
+            "records": ranges,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        })
+        # Pull all number pages safely.
+        all_records, cursor = [], None
+        for _ in range(100):
+            page = lamix.numbers(limit=500, after=cursor)
+            all_records.extend(page.get("records", []))
+            cursor = page.get("nextCursor")
+            if not cursor:
+                break
+        db.collection("cache").document("numbers").set({
+            "records": all_records,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        })
+        send_message(chat_id, f"Sync complete.\nRanges: {len(ranges)}\nNumbers: {len(all_records)}", admin_keyboard())
+    except Exception as e:
+        send_message(chat_id, f"Sync failed: {e}", admin_keyboard())
 
-def admin_stats(chat_id):
-    with pool.connection() as c:
-        users=c.execute('SELECT COUNT(*) FROM users').fetchone()[0]
-        orders=c.execute("SELECT COUNT(*) FROM orders WHERE status='active'").fetchone()[0]
-        bal=c.execute('SELECT COALESCE(SUM(balance),0) FROM users').fetchone()[0]
-    send(chat_id,f'📊 <b>Statistics</b>\n\nUsers: <code>{users}</code>\nActive orders: <code>{orders}</code>\nUser balances: <code>{bal}</code>',admin_kb())
+def admin_ranges(chat_id):
+    try:
+        records = lamix.ranges().get("records", [])
+        lines = ["<b>Ranges</b>", ""]
+        for r in records[:50]:
+            rates = ", ".join(
+                f"{x.get('plan')}: {x.get('payoutRate')}"
+                for x in r.get("rates", [])
+            )
+            lines.append(
+                f"• <b>{r.get('name','Unknown')}</b> | "
+                f"numbers={r.get('numbers',0)} | rates={rates or 'none'}"
+            )
+        send_message(chat_id, "\n".join(lines) or "No ranges.", admin_keyboard())
+    except Exception as e:
+        send_message(chat_id, f"Ranges unavailable: {e}", admin_keyboard())
 
-def handle_message(m):
-    if m.get('chat',{}).get('type')!='private': return
-    uid=int(m['from']['id']); chat=m['chat']['id']; text=(m.get('text') or '').strip()
-    if text.startswith('/start'):
-        p=text.split(); ref=int(p[1]) if len(p)>1 and p[1].isdigit() else None
-        user_upsert(m['from'],ref)
-        send(chat,'👋 <b>Welcome to AlphaWorkers</b>\n\nChoose an option:',main_kb(is_admin(uid))); return
-    user_upsert(m['from'])
-    if text=='🟢 Get Number':
-        send(chat,'📱 <b>Get Number</b>\n\nChoose a country/range:',inline([[{'text':'🌎 Browse Ranges','callback_data':'a_ranges'}]]))
-    elif text=='🟢 2FA':
-        send(chat,'🔐 <b>2FA</b>\n\nSend your TOTP secret (Base32) as a message. This is for accounts you are authorized to access.')
-        states[uid]='2fa'
-    elif text=='🔵 Traffic': traffic(chat)
-    elif text=='🔵 Wallet': wallet(chat,uid)
-    elif text=='🔴 Invite':
-        me=tg('getMe').get('result',{}).get('username',''); send(chat,f'🔗 <b>Your referral link</b>\n<code>https://t.me/{me}?start={uid}</code>')
-    elif text=='🔴 Support': send(chat,f'🆘 <b>Support</b>\n{setting("support_id","Not configured")}')
-    elif text=='🟢 AdminPanel' and is_admin(uid): send(chat,'🛠 <b>Admin Panel</b>',admin_kb())
-    elif states.get(uid)=='2fa':
+def admin_numbers(chat_id):
+    try:
+        data = lamix.numbers(limit=50)
+        lines = ["<b>Numbers</b>", ""]
+        for r in data.get("records", []):
+            lines.append(
+                f"• {mask_number(r.get('number',''))} | {r.get('range','')} | "
+                f"{r.get('status','')} | {r.get('plan','')}"
+            )
+        lines.append("")
+        lines.append("Use Lamix assignment controls from your authorized admin tooling.")
+        send_message(chat_id, "\n".join(lines), admin_keyboard())
+    except Exception as e:
+        send_message(chat_id, f"Numbers unavailable: {e}", admin_keyboard())
+
+def admin_clients(chat_id):
+    try:
+        records = lamix.clients(limit=100).get("records", [])
+        lines = ["<b>Clients</b>", ""]
+        for c in records[:50]:
+            lines.append(
+                f"• {c.get('username','')} | {c.get('name','')} | "
+                f"numbers={c.get('numbers',0)} | disabled={c.get('disabled',False)}"
+            )
+        send_message(chat_id, "\n".join(lines) or "No clients.", admin_keyboard())
+    except Exception as e:
+        send_message(chat_id, f"Clients unavailable: {e}", admin_keyboard())
+
+def admin_traffic(chat_id):
+    try:
+        data = lamix.cdrs(limit=100)
+        records = data.get("records", [])
+        total = sum((dec(x.get("payout")) for x in records), Decimal("0"))
+        cleared = sum(1 for x in records if x.get("status") == "cleared")
+        send_message(
+            chat_id,
+            "<b>Admin Traffic</b>\n\n"
+            f"Sample records: {len(records)}\n"
+            f"Cleared: {cleared}\n"
+            f"Own payout total in sample: {total:.4f}",
+            admin_keyboard(),
+        )
+    except Exception as e:
+        send_message(chat_id, f"Traffic unavailable: {e}", admin_keyboard())
+
+def admin_users(chat_id):
+    snaps = list(db.collection("users").limit(50).stream())
+    lines = ["<b>Users</b>", ""]
+    for snap in snaps:
+        d = snap.to_dict()
+        lines.append(
+            f"• <code>{snap.id}</code> @{d.get('username','-')} "
+            f"| balance={d.get('balance','0')}"
+        )
+    send_message(chat_id, "\n".join(lines), admin_keyboard())
+
+def admin_wallet(chat_id):
+    total = Decimal("0")
+    count = 0
+    for snap in db.collection("users").stream():
+        count += 1
+        total += dec(snap.to_dict().get("balance", "0"))
+    send_message(chat_id, f"<b>Wallet Overview</b>\n\nUsers: {count}\nLiability: {total:.4f}", admin_keyboard())
+
+def admin_settings(chat_id):
+    s = get_settings()
+    send_message(
+        chat_id,
+        "<b>Settings</b>\n\n"
+        f"Main channel: {s.get('main_channel') or 'Not set'}\n"
+        f"Support: {s.get('support_id') or 'Not set'}\n"
+        f"Forward group: {s.get('forward_group') or 'Not set'}\n"
+        f"Min withdraw: {s.get('min_withdraw')}\n"
+        f"Referral bonus: {s.get('referral_join_bonus')}\n"
+        f"Referral commission: {s.get('referral_commission_percent')}%\n"
+        f"Number count: {s.get('number_request_count')}",
+        settings_keyboard(),
+    )
+
+def admin_forcejoin(chat_id):
+    s = get_settings()
+    send_message(
+        chat_id,
+        "<b>Force Join</b>\n\n"
+        f"Enabled: {s.get('force_join_enabled', False)}\n"
+        f"Channels: {', '.join(s.get('force_join_channels', [])) or 'None'}",
+        {"inline_keyboard": [
+            [button(
+                "Disable" if s.get("force_join_enabled") else "Enable",
+                "toggle_forcejoin",
+                style="danger" if s.get("force_join_enabled") else "success"
+            )],
+            [button("BACK", "admin", style="danger")]
+        ]}
+    )
+
+# ---------------- Callback router ----------------
+def callback_router(q):
+    uid = int(q["from"]["id"])
+    data = q.get("data", "")
+    chat_id = q["message"]["chat"]["id"]
+    message_id = q["message"]["message_id"]
+    answer_callback(q["id"])
+
+    if data == "home":
+        user = get_user(uid) or {"first_name": q["from"].get("first_name", "User")}
+        edit_message(chat_id, message_id, home_text(user), main_keyboard(uid))
+    elif data == "user_numbers":
+        show_numbers(chat_id)
+    elif data == "twofa":
+        show_2fa(chat_id)
+        set_state(uid, {"action": "totp"})
+    elif data == "traffic":
+        show_traffic(chat_id)
+    elif data == "wallet":
+        show_wallet(chat_id, uid)
+    elif data == "invite":
+        show_invite(chat_id, uid)
+    elif data == "support":
+        show_support(chat_id)
+    elif data == "admin" and uid == ADMIN_ID:
+        show_admin(chat_id)
+    elif uid == ADMIN_ID:
+        if data == "adm_dashboard": admin_dashboard(chat_id)
+        elif data == "adm_sync": admin_sync(chat_id)
+        elif data == "adm_ranges": admin_ranges(chat_id)
+        elif data == "adm_numbers": admin_numbers(chat_id)
+        elif data == "adm_clients": admin_clients(chat_id)
+        elif data == "adm_traffic": admin_traffic(chat_id)
+        elif data == "adm_users": admin_users(chat_id)
+        elif data == "adm_wallet": admin_wallet(chat_id)
+        elif data == "adm_settings": admin_settings(chat_id)
+        elif data == "adm_forcejoin": admin_forcejoin(chat_id)
+        elif data == "adm_broadcast":
+            set_state(uid, {"action": "broadcast"})
+            send_message(chat_id, "Send the informational broadcast text.", back_kb())
+        elif data == "toggle_forcejoin":
+            s = get_settings()
+            set_setting("force_join_enabled", not bool(s.get("force_join_enabled")))
+            admin_forcejoin(chat_id)
+        elif data == "set_main_channel":
+            set_state(uid, {"action": "main_channel"})
+            send_message(chat_id, "Send the main channel username/link.", settings_keyboard())
+        elif data == "set_support":
+            set_state(uid, {"action": "support"})
+            send_message(chat_id, "Send support ID/link.", settings_keyboard())
+        elif data == "set_group":
+            set_state(uid, {"action": "group"})
+            send_message(chat_id, "Send forward group chat ID.", settings_keyboard())
+        elif data == "set_min_withdraw":
+            set_state(uid, {"action": "min_withdraw"})
+            send_message(chat_id, "Send minimum withdrawal amount.", settings_keyboard())
+        elif data == "set_ref_bonus":
+            set_state(uid, {"action": "ref_bonus"})
+            send_message(chat_id, "Send referral join bonus amount.", settings_keyboard())
+        elif data == "set_ref_pct":
+            set_state(uid, {"action": "ref_pct"})
+            send_message(chat_id, "Send referral commission percentage (0-100).", settings_keyboard())
+        elif data == "set_num_count":
+            set_state(uid, {"action": "num_count"})
+            send_message(chat_id, "Send default number count (1-6).", settings_keyboard())
+
+# ---------------- Update handling ----------------
+def handle_update(update):
+    if "callback_query" in update:
+        callback_router(update["callback_query"])
+        return
+    message = update.get("message")
+    if not message:
+        return
+    uid = int(message["from"]["id"])
+    if message.get("text", "").startswith("/start"):
+        handle_start(message)
+        return
+    with state_lock:
+        st = states.get(str(uid))
+    if st and st.get("action") == "totp":
+        pop_state(uid)
         try:
-            secret=text.replace(' ','').upper(); code=pyotp.TOTP(secret).now()
-            send(chat,f'🔐 <b>Current TOTP</b>\n\n<code>{code}</code>\n\nValid for the current TOTP window.')
-        except Exception: send(chat,'❌ Invalid TOTP secret. Please send a valid Base32 secret.')
-        states.pop(uid,None)
+            code = calculate_totp(message.get("text", ""))
+            send_message(message["chat"]["id"], f"Current TOTP: <code>{code}</code>", back_kb())
+        except Exception as e:
+            send_message(message["chat"]["id"], f"TOTP error: {e}", back_kb())
+        return
+    if message.get("text"):
+        handle_text(message)
 
-def callback(q):
-    uid=int(q['from']['id']); chat=q['message']['chat']['id']; mid=q['message']['message_id']; d=q.get('data','')
-    if d.startswith('a_') or d in ('a_home',):
-        if not is_admin(uid): answer(q['id'],'Not authorized.',True); return
-    answer(q['id'])
-    if d=='a_home': edit(chat,mid,'🛠 <b>Admin Panel</b>',admin_kb())
-    elif d=='a_numbers': show_numbers(chat,mid)
-    elif d=='a_ranges': show_ranges(chat,mid)
-    elif d=='a_stats': admin_stats(chat)
-    elif d=='a_clients':
-        try:
-            data=lamix.clients(limit=50); clients=data.get('clients',data if isinstance(data,list) else [])
-            txt='👥 <b>Clients</b>\n\n'+('\n'.join(f'• {c.get("username","?")} — {c.get("status","")}' for c in clients) or 'No clients.')
-            edit(chat,mid,short(txt),admin_kb())
-        except Exception as e: edit(chat,mid,f'❌ <code>{short(e,500)}</code>',admin_kb())
-    elif d=='a_cdr':
-        try:
-            data=lamix.cdrs(limit=20); rows=data.get('cdrs',data if isinstance(data,list) else [])
-            txt='💵 <b>CDR</b>\n\n'+('\n'.join(f'• {r.get("number", "?")} — {r.get("duration", "?")} — {r.get("rate", "?")}' for r in rows) or 'No CDR records.')
-            edit(chat,mid,short(txt),admin_kb())
-        except Exception as e: edit(chat,mid,f'❌ <code>{short(e,500)}</code>',admin_kb())
-    elif d=='a_settings':
-        txt='⚙️ <b>Settings</b>\n\n'+ '\n'.join(f'• {k}: <code>{setting(k)}</code>' for k in ['support_id','main_channel','referral_bonus','commission_percent','default_quantity'])
-        edit(chat,mid,txt,admin_kb())
-    elif d.startswith('range:'):
-        rid=d.split(':',1)[1]
-        show_numbers(chat,mid,rid)
+# ---------------- Web endpoints ----------------
+@app.get("/")
+def index():
+    return "Lamix Safe Bot OK"
 
-states={}
+@app.get("/health")
+def health():
+    return jsonify({"ok": True, "service": "lamix-safe-bot", "time": now_iso()})
 
-# -------------------- Polling + health --------------------
-app=Flask(__name__)
-@app.get('/')
-def root(): return jsonify(ok=True,service='alpha-lamix-bot')
-@app.get('/health')
-def health(): return jsonify(ok=True,db=True,lamix=True)
+@app.post("/telegram/webhook")
+def telegram_webhook():
+    if WEBHOOK_SECRET:
+        supplied = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if not hmac.compare_digest(supplied, WEBHOOK_SECRET):
+            return jsonify({"ok": False}), 403
+    update = request.get_json(silent=True)
+    if not update:
+        return jsonify({"ok": False}), 400
+    try:
+        handle_update(update)
+    except Exception:
+        log.exception("Update handling failed")
+    return jsonify({"ok": True})
 
-def polling():
-    offset=None
-    while True:
-        try:
-            p={'timeout':25,'allowed_updates':['message','callback_query']}
-            if offset is not None:p['offset']=offset
-            r=requests.get(f'{TG}/getUpdates',params=p,timeout=35).json()
-            for u in r.get('result',[]):
-                offset=u['update_id']+1
-                try:
-                    if 'message' in u: handle_message(u['message'])
-                    elif 'callback_query' in u: callback(u['callback_query'])
-                except Exception: log.exception('update failed')
-        except Exception: log.exception('polling failed'); time.sleep(3)
+@app.post("/internal/set-webhook")
+def internal_set_webhook():
+    # Protect this endpoint with the same secret if enabled.
+    if WEBHOOK_SECRET:
+        supplied = request.headers.get("X-Webhook-Admin-Secret", "")
+        if not hmac.compare_digest(supplied, WEBHOOK_SECRET):
+            return jsonify({"ok": False}), 403
+    try:
+        return jsonify({"ok": True, "result": set_webhook()})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
-def main():
-    db_init(); log.info('Bot starting')
-    threading.Thread(target=polling,daemon=True).start()
-    app.run(host='0.0.0.0',port=PORT,debug=False,use_reloader=False)
+def startup():
+    try:
+        get_settings()
+        set_webhook()
+    except Exception:
+        log.exception("Startup initialization failed")
 
-if __name__=='__main__': main()
+if __name__ == "__main__":
+    startup()
+    app.run(host="0.0.0.0", port=PORT)
