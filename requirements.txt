@@ -1,5 +1,5 @@
-requests
-firebase-admin
-pyotp
-beautifulsoup4
-flask
+requests>=2.32,<3
+psycopg[binary]>=3.2,<4
+psycopg-pool>=3.2,<4
+Flask>=3.0,<4
+pyotp>=2.9,<3
